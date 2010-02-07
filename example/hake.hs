@@ -1,57 +1,66 @@
 {-# OPTIONS -O2 -Wall #-}
 
-import System.Posix(getFileStatus, modificationTime, EpochTime)
+import System.Posix(getFileStatus, modificationTime, EpochTime, FileStatus)
 import Data.List(intercalate)
-import Data.ByteString(ByteString)
 import qualified Data.ByteString as BS
 import Data.Binary(Binary(..), encodeFile, decodeFile)
-import Data.Binary.Get(getByteString, remaining)
-import Data.Binary.Put(putByteString)
 import qualified System.Process as Process
 import System.Exit(ExitCode(..))
+import Control.Monad.Writer(WriterT(..), tell)
+import Max(Max(..), AddBounds(..))
+import FileData(inFileData)
+import Control.Monad.Trans(MonadIO, liftIO)
 
-newtype FileData = FileData { unFileData :: ByteString }
-inFileData :: (ByteString -> ByteString)
-              -> FileData -> FileData
-inFileData f = FileData . f . unFileData
+type IOM a = IO (Maybe a)
 
-instance Binary FileData where
-  get = FileData `fmap` (getByteString . fromIntegral =<< remaining)
-  put = putByteString . unFileData
+tryMaybe :: IO a -> IOM a
+tryMaybe act = (Just `fmap` act) `catch`
+               const (return Nothing)
 
-data Target = Target { targetFilePath :: FilePath,
-                       targetBuild :: IO () }
+io :: (MonadIO m) => IO a -> m a
+io = liftIO
+  
+type Build a = WriterT (Max (AddBounds EpochTime)) IO a
 
-data BuildResult = BuildResult { buildResultMTime :: EpochTime
-                               , buildResultPath :: FilePath }
+runBuild :: Build a -> IO a
+runBuild = fmap fst . runWriterT
 
-sourceFile :: FilePath -> Target
-sourceFile path = Target path (getFileStatus path >> return ())
+mFileStatus :: FilePath -> IOM FileStatus
+mFileStatus = tryMaybe . getFileStatus
 
-whenBuildNecessary :: EpochTime -> FilePath -> IO () -> IO ()
+mmTime :: FilePath -> IOM EpochTime
+mmTime = (fmap . fmap) modificationTime . mFileStatus
+
+whenBuildNecessary :: AddBounds EpochTime -> FilePath -> IO () -> IO ()
 whenBuildNecessary inputMTime outputPath action = do
-  outputMTime <- tryMaybe (modificationTime `fmap` getFileStatus outputPath)
+  outputMTime <- mmTime outputPath
   case outputMTime of
     Nothing -> rebuild "missing output"
     Just t ->
-      if t < inputMTime
+      if Unbound t < inputMTime
       then rebuild "older output"
-      else putStrLn "Not rebuilding (output is newer than input)"
+      else keep "output is newer"
   where
+    keep reason = do
+      putStrLn $ "Not rebuilding (" ++ reason ++ ")"
     rebuild reason = do
       putStrLn $ "Rebuilding (" ++ reason ++ ")"
       action
 
-apply :: Binary a => (a -> a) -> FilePath -> BuildResult -> Target
-apply func outputPath (BuildResult inputMTime inputPath) = Target outputPath $ do
-  whenBuildNecessary inputMTime outputPath $ do
-    encodeFile outputPath =<< func `fmap` decodeFile inputPath
+build :: FilePath -> Build a -> (a -> IO ()) -> Build FilePath
+build outputPath inputsBuild outputAction = do
+  modTime <- io $ do
+    (r, newestInputMTime) <- runWriterT inputsBuild
+    whenBuildNecessary (unMax newestInputMTime) outputPath (outputAction r)
+    modificationTime `fmap` getFileStatus outputPath
+  tell . Max . Unbound $ modTime
+  return outputPath
 
-build :: Target -> IO BuildResult
-build (Target path action) = do
-  action
-  mtime <- modificationTime `fmap` getFileStatus path
-  return (BuildResult mtime path)
+apply :: Binary a => FilePath -> (a -> a) -> Build FilePath -> Build FilePath
+apply outputPath func inputBuild = build outputPath inputBuild action
+  where
+    action inputFile =
+      encodeFile outputPath =<< func `fmap` decodeFile inputFile
 
 gccLine :: FilePath -> [FilePath] -> String
 gccLine output inputs = "gcc -c -g -Wall -o " ++ output ++ " " ++ intercalate " " inputs
@@ -66,26 +75,23 @@ buildCommand cmd = do
       putStrLn $ "Failed with " ++ show rc ++ "!"
       undefined
 
-compiler :: FilePath -> [BuildResult] -> IO Target
-compiler outputPath inputs = return . Target outputPath $ do
-  whenBuildNecessary (maximum (map buildResultMTime inputs)) outputPath $ do
-    buildCommand . gccLine outputPath . map buildResultPath $ inputs
+compiler :: FilePath -> [Build FilePath] -> Build FilePath
+compiler outputPath inputs = build outputPath (sequence inputs) action
+  where
+    action inputFiles = buildCommand . gccLine outputPath $ inputFiles
 
+a_c :: Build FilePath
+a_c = return "a.c"
+reversed_a_h :: Build FilePath
+reversed_a_h = return "a.h.reversed"
+a_h :: Build FilePath
+a_h = apply "a.h" (inFileData BS.reverse) reversed_a_h
+a_o :: Build FilePath
+a_o = compiler "a.o" [a_c]
 -- executable = build a_o >>= linker "exe"
-a_o :: IO Target
-a_o = compiler "a.o" . return =<< build a_c
-a_c :: Target
-a_c = sourceFile "a.c"
-reversed_a_h :: Target
-reversed_a_h = sourceFile "a.h.reversed"
-a_h :: IO Target
-a_h = apply (inFileData BS.reverse) "a.h" `fmap` (build reversed_a_h)
-
-tryMaybe :: IO a -> IO (Maybe a)
-tryMaybe act = (Just `fmap` act) `catch` (const . return) Nothing
 
 main :: IO ()
 main = do
-  build =<< a_h
-  build =<< a_o
+  runBuild a_h
+  runBuild a_o
   return ()
